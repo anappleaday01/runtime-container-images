@@ -1,10 +1,22 @@
 ARG BASE_IMAGE=nvidia/cuda:12.6.1-cudnn-devel-ubuntu24.04
 FROM ${BASE_IMAGE}
 
+# 定制版：PyTorch 2.6.0 (cu126) + Python 3.12.8，锁定 DG 论文官方 requirements.txt 全部版本
+# 来源：https://github.com/EterLuu/runtime-container-images
+#       images/modelarts/cuda/12.6.1-v100-ubuntu24.04/Dockerfile
+# 修改点（相对上游）：
+#   1. PYTHON_VERSION 3.11 -> 3.12.8（论文代码 training.py 含 PEP 701 f-string，3.11 会 SyntaxError）
+#   2. TORCH_VERSION 2.7.1 -> 2.6.0，torchvision 0.21.0，torchaudio 2.6.0
+#   3. conda 环境名 torch-2.7.1 -> torch-2.6.0（全局统一）
+#   4. numpy<2.0 -> numpy==2.1.3（论文锁定）
+#   5. PIP_CONSTRAINT 从 4 项扩展到论文 19 项精确版本，杜绝版本漂移
+# 用法：替换 fork 仓库中同路径 Dockerfile 后，按手册走 Actions 发布到 SWR
+
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=Asia/Shanghai
 
-# V100 = Volta = sm_70
+# V100 = Volta = sm_70。若 ModelArts 选 T4/A10 规格，删掉此行或改对应 arch
+# （torch 2.6.0 的 cu126 wheel 是多架构 fat binary，此变量只影响源码编译扩展）
 ENV TORCH_CUDA_ARCH_LIST="7.0"
 ENV NVIDIA_VISIBLE_DEVICES=all
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
@@ -55,7 +67,7 @@ RUN set -eux; \
     apt-get clean; \
     rm -rf /var/lib/apt/lists/*
 
-# Create ma-group / ma-user
+# Create ma-group / ma-user（ModelArts 要求 uid=1000, gid=100）
 RUN set -eux; \
     existing_user="$(getent passwd 1000 | awk -F ':' '{print $1}' || true)"; \
     existing_group="$(getent group 100 | awk -F ':' '{print $1}' || true)"; \
@@ -72,12 +84,10 @@ RUN set -eux; \
     fi; \
     chmod -R 750 /home/ma-user
 
-# Allow ma-user to use sudo
 RUN set -eux; \
     echo 'ma-user ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/ma-user; \
     chmod 0440 /etc/sudoers.d/ma-user
 
-# Install OpenSSH for ModelArts
 RUN set -eux; \
     ssh -V; \
     mkdir -p /run/sshd; \
@@ -151,34 +161,48 @@ RUN set -eux; \
       > /home/ma-user/.pip/pip.conf
 
 # Create CUDA/PyTorch environment for V100
-# The ipykernel package is mandatory for starting a kernel.
 SHELL ["/bin/bash", "-lc"]
 
 ARG PYPI_INDEX_URL=https://mirrors.huaweicloud.com/repository/pypi/simple
 ARG PYPI_TRUSTED_HOST=mirrors.huaweicloud.com
 ARG PYTORCH_CUDA_INDEX_URL=https://download.pytorch.org/whl/cu126
 
-# Can be overwritted：
-# docker build --build-arg TORCH_VERSION=2.7.1 ...
-ARG TORCH_VERSION=2.7.1
-ARG TORCHVISION_VERSION=0.22.1
-ARG TORCHAUDIO_VERSION=2.7.1
-ARG PYTHON_VERSION=3.11
+# === 论文锁定的版本（来自官方 requirements.txt）===
+ARG TORCH_VERSION=2.6.0
+ARG TORCHVISION_VERSION=0.21.0
+ARG TORCHAUDIO_VERSION=2.6.0
+ARG PYTHON_VERSION=3.12.8
 
 RUN set -eux; \
     source /home/ma-user/miniconda/etc/profile.d/conda.sh; \
     \
-    conda create -y --name torch-2.7.1 python=${PYTHON_VERSION} pip "numpy<2.0"; \
+    conda create -y --name torch-2.6.0 python=${PYTHON_VERSION} pip; \
     printf '%s\n' \
         "torch==${TORCH_VERSION}" \
         "torchvision==${TORCHVISION_VERSION}" \
         "torchaudio==${TORCHAUDIO_VERSION}" \
-        "numpy<2.0" \
+        "torchinfo==1.8.0" \
+        "tensorboard==2.19.0" \
+        "transformers==4.49.0" \
+        "datasets==3.3.2" \
+        "librosa==0.10.2.post1" \
+        "accelerate==1.5.1" \
+        "scikit-learn==1.6.1" \
+        "pandas==2.2.3" \
+        "numpy==2.1.3" \
+        "matplotlib==3.10.0" \
+        "seaborn==0.13.2" \
+        "jupyter==1.1.1" \
+        "tqdm==4.67.1" \
+        "requests==2.32.3" \
+        "python-dotenv==1.0.1" \
+        "natsort==8.4.0" \
+        "click==8.1.8" \
         > /tmp/pip-constraints.txt; \
     \
     export PIP_CONSTRAINT=/tmp/pip-constraints.txt; \
     \
-    conda activate torch-2.7.1; \
+    conda activate torch-2.6.0; \
     \
     python -m pip install --upgrade pip wheel setuptools pyyaml packaging; \
     \
@@ -191,7 +215,7 @@ RUN set -eux; \
     DS_BUILD_OPS=0 python -m pip install --no-cache-dir \
         -i "${PYPI_INDEX_URL}" \
         --trusted-host "${PYPI_TRUSTED_HOST}" \
-        "numpy<2.0" \
+        "numpy==2.1.3" \
         "ipykernel>=6.29,<7" \
         transformers \
         accelerate \
@@ -208,13 +232,21 @@ RUN set -eux; \
         scikit-learn \
         pandas \
         matplotlib \
+        seaborn \
+        torchinfo \
+        tensorboard \
+        jupyter \
+        requests \
+        python-dotenv \
+        natsort \
+        click \
         pillow \
         psutil; \
     \
     python -m ipykernel install \
         --user \
-        --name torch-2.7.1 \
-        --display-name "torch-2.7.1"; \
+        --name torch-2.6.0 \
+        --display-name "torch-2.6.0"; \
     \
     mkdir -p "${CONDA_PREFIX}/etc/conda/activate.d" "${CONDA_PREFIX}/etc/conda/deactivate.d"; \
     cp /tmp/pip-constraints.txt "${CONDA_PREFIX}/pip-constraints.txt"; \
@@ -231,11 +263,11 @@ RUN set -eux; \
     rm -rf /home/ma-user/.cache/pip /tmp/pip-constraints.txt; \
     \
     echo 'source /home/ma-user/miniconda/etc/profile.d/conda.sh' >> /home/ma-user/.bashrc; \
-    echo 'conda activate torch-2.7.1' >> /home/ma-user/.bashrc
+    echo 'conda activate torch-2.6.0' >> /home/ma-user/.bashrc
 
-ENV CONDA_DEFAULT_ENV=torch-2.7.1
-ENV PATH=/home/ma-user/miniconda/envs/torch-2.7.1/bin:/home/ma-user/miniconda/bin:${PATH}
-ENV PIP_CONSTRAINT=/home/ma-user/miniconda/envs/torch-2.7.1/pip-constraints.txt
+ENV CONDA_DEFAULT_ENV=torch-2.6.0
+ENV PATH=/home/ma-user/miniconda/envs/torch-2.6.0/bin:/home/ma-user/miniconda/bin:${PATH}
+ENV PIP_CONSTRAINT=/home/ma-user/miniconda/envs/torch-2.6.0/pip-constraints.txt
 
 USER ma-user
 WORKDIR /home/ma-user
